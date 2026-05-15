@@ -1,0 +1,9 @@
+torch
+torchvision
+ultralytics
+opencv-python
+matplotlib
+numpy
+easydict
+pyyaml
+huggingface_hub
