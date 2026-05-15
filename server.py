@@ -3,9 +3,11 @@
 Remote pose inference server.
 Receives JPEG frames over TCP, runs YOLOv8-pose + MotionBERT on GPU,
 sends back 3D joints and 2D keypoints as JSON.
+Also displays the received video stream and 3D skeleton locally.
 
 Usage:
     python server.py --host 0.0.0.0 --port 9000
+    python server.py --host 0.0.0.0 --port 9000 --no-display
 """
 
 import sys
@@ -25,11 +27,17 @@ import yaml
 from easydict import EasyDict as edict
 from ultralytics import YOLO
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 # Reuse helpers from live_pose3d
 from live_pose3d import (
     coco_to_h36m,
     normalize_keypoints,
     load_motionbert,
+    draw_2d_skeleton,
+    update_3d_plot,
     CLIP_LEN,
     MOTIONBERT_ROOT,
 )
@@ -37,11 +45,31 @@ from protocol import send_msg, recv_msg, unpack_frame
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Shared display state — written by client handler, read by main thread
+display_lock = threading.Lock()
+display_state = {
+    'frame': None,        # BGR frame with 2D overlay
+    'skeleton_img': None, # rendered 3D skeleton
+}
 
-def handle_client(conn, addr, yolo, motionbert, mb_args):
+
+def render_3d_to_image(fig, ax, joints_3d):
+    """Render 3D skeleton to a BGR numpy image via the Agg backend."""
+    update_3d_plot(ax, joints_3d)
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)
+    return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+
+
+def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
     """Handle a single client connection."""
     print(f'Client connected: {addr}')
     kpts_buffer = deque(maxlen=CLIP_LEN)
+
+    # Per-client matplotlib figure (Agg, thread-safe)
+    fig = plt.figure(figsize=(5, 5), dpi=100)
+    ax = fig.add_subplot(111, projection='3d')
 
     try:
         while True:
@@ -50,7 +78,6 @@ def handle_client(conn, addr, yolo, motionbert, mb_args):
             if data is None:
                 break
 
-            # Non-blocking drain: keep reading if more data is available
             conn.setblocking(False)
             while True:
                 try:
@@ -85,9 +112,14 @@ def handle_client(conn, addr, yolo, motionbert, mb_args):
                     coco_kpts = kp_data[0].cpu().numpy()  # (17, 3)
 
             response = {}
+            joints_3d = None
 
             if coco_kpts is not None:
                 response['coco_keypoints'] = coco_kpts.tolist()
+
+                # Draw 2D overlay on frame for display
+                if show_display:
+                    draw_2d_skeleton(frame, coco_kpts)
 
                 # Convert to H36M and buffer
                 h36m_kpts = coco_to_h36m(coco_kpts)
@@ -119,6 +151,15 @@ def handle_client(conn, addr, yolo, motionbert, mb_args):
                 response['coco_keypoints'] = None
                 response['joints_3d'] = None
 
+            # Update shared display state
+            if show_display:
+                skeleton_img = None
+                if joints_3d is not None:
+                    skeleton_img = render_3d_to_image(fig, ax, joints_3d)
+                with display_lock:
+                    display_state['frame'] = frame.copy()
+                    display_state['skeleton_img'] = skeleton_img
+
             # Send JSON response
             payload = json.dumps(response).encode('utf-8')
             send_msg(conn, payload)
@@ -126,7 +167,13 @@ def handle_client(conn, addr, yolo, motionbert, mb_args):
     except (ConnectionResetError, BrokenPipeError):
         pass
     finally:
+        plt.close(fig)
         conn.close()
+        # Clear display on disconnect
+        if show_display:
+            with display_lock:
+                display_state['frame'] = None
+                display_state['skeleton_img'] = None
         print(f'Client disconnected: {addr}')
 
 
@@ -134,7 +181,11 @@ def main():
     parser = argparse.ArgumentParser(description='Remote pose inference server')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9000)
+    parser.add_argument('--no-display', action='store_true',
+                        help='Disable local display windows')
     args = parser.parse_args()
+
+    show_display = not args.no_display
 
     # Load models
     print('Loading YOLOv8-pose...')
@@ -157,15 +208,47 @@ def main():
     srv.listen(1)
     print(f'Listening on {args.host}:{args.port}')
 
+    if show_display:
+        print('Display enabled. Press q in any window to quit.')
+
     try:
-        while True:
-            conn, addr = srv.accept()
-            t = threading.Thread(
-                target=handle_client,
-                args=(conn, addr, yolo, motionbert, mb_args),
-                daemon=True,
-            )
-            t.start()
+        # Accept clients in a background thread so main thread can run display
+        def accept_loop():
+            try:
+                while True:
+                    conn, addr = srv.accept()
+                    t = threading.Thread(
+                        target=handle_client,
+                        args=(conn, addr, yolo, motionbert, mb_args, show_display),
+                        daemon=True,
+                    )
+                    t.start()
+            except OSError:
+                pass  # socket closed
+
+        accept_thread = threading.Thread(target=accept_loop, daemon=True)
+        accept_thread.start()
+
+        if show_display:
+            # Main thread drives OpenCV display (required on macOS/Linux)
+            while True:
+                with display_lock:
+                    frame = display_state['frame']
+                    skeleton_img = display_state['skeleton_img']
+
+                if frame is not None:
+                    cv2.imshow('Server - Received Stream', frame)
+                if skeleton_img is not None:
+                    cv2.imshow('Server - 3D Skeleton', skeleton_img)
+
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('q'):
+                    break
+            cv2.destroyAllWindows()
+        else:
+            # No display — just block on accept thread
+            accept_thread.join()
+
     except KeyboardInterrupt:
         print('\nShutting down.')
     finally:

@@ -18,15 +18,23 @@ import time
 import numpy as np
 import cv2
 import matplotlib
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')  # Non-interactive backend — no Tk, no GIL issues
 import matplotlib.pyplot as plt
 
 from live_pose3d import (
     draw_2d_skeleton,
     update_3d_plot,
-    COCO_BONES,
 )
 from protocol import send_msg, recv_msg, pack_frame
+
+
+def render_3d_to_image(fig, ax, joints_3d):
+    """Render 3D skeleton to a BGR numpy image via the Agg backend."""
+    update_3d_plot(ax, joints_3d)
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)                     # RGBA
+    return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
 
 
 def main():
@@ -51,12 +59,10 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f'Webcam: {frame_w}x{frame_h}')
 
-    # Matplotlib 3D setup
-    plt.ion()
-    fig = plt.figure(figsize=(6, 6))
+    # Matplotlib 3D figure (offscreen via Agg)
+    fig = plt.figure(figsize=(5, 5), dpi=100)
     ax = fig.add_subplot(111, projection='3d')
     ax.set_title('Waiting for pose...')
-    fig.show()
 
     # Shared state between threads
     latest_result = {'coco_keypoints': None, 'joints_3d': None}
@@ -94,6 +100,7 @@ def main():
     fps_counter = 0
     fps_time = time.time()
     fps_display = 0.0
+    skeleton_img = None
 
     try:
         while running:
@@ -122,9 +129,7 @@ def main():
                 draw_2d_skeleton(frame, coco_kpts)
 
             if joints_3d is not None:
-                update_3d_plot(ax, joints_3d)
-                fig.canvas.draw_idle()
-                fig.canvas.flush_events()
+                skeleton_img = render_3d_to_image(fig, ax, joints_3d)
 
             # FPS counter
             fps_counter += 1
@@ -140,6 +145,8 @@ def main():
             )
 
             cv2.imshow('Remote Pose (press q to quit)', frame)
+            if skeleton_img is not None:
+                cv2.imshow('3D Skeleton', skeleton_img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
