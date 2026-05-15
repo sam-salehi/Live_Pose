@@ -12,12 +12,17 @@ Usage:
 
 import sys
 import os
+import time
 import json
 import socket
 import argparse
 import threading
 from collections import deque
 from functools import partial
+
+# Force xcb Qt backend before cv2 is imported — prevents Qt thread-affinity
+# errors when OpenCV/YOLO is used from worker threads alongside imshow in main.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import numpy as np
 import cv2
@@ -72,27 +77,15 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
     fig = plt.figure(figsize=(5, 5), dpi=100)
     ax = fig.add_subplot(111, projection='3d')
 
+    frame_count = 0
     try:
         while True:
-            # Drain to most recent frame (drop stale ones)
             data = recv_msg(conn)
             if data is None:
                 break
 
-            conn.setblocking(False)
-            while True:
-                try:
-                    newer = recv_msg(conn)
-                    if newer is None:
-                        data = None
-                        break
-                    data = newer
-                except BlockingIOError:
-                    break
-            conn.setblocking(True)
-
-            if data is None:
-                break
+            frame_count += 1
+            t_recv = time.perf_counter()
 
             # Decode frame
             frame_w, frame_h, jpeg_bytes = unpack_frame(data)
@@ -100,7 +93,12 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                 np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
             )
             if frame is None:
+                print(f'[{addr}] Frame {frame_count}: imdecode failed, skipping')
                 continue
+
+            print(f'[{addr}] Frame {frame_count}: {frame_w}x{frame_h}  '
+                  f'JPEG {len(jpeg_bytes)/1024:.1f}KB  '
+                  f'device={DEVICE}')
 
             # Immediately update display with the raw frame so the video
             # stream stays smooth regardless of inference speed.
@@ -109,8 +107,10 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                     display_state['frame'] = frame.copy()
 
             # YOLOv8-pose detection
+            t_yolo = time.perf_counter()
             results = yolo(frame, verbose=False)
             result = results[0]
+            dt_yolo = (time.perf_counter() - t_yolo) * 1000
 
             coco_kpts = None
             if result.keypoints is not None and len(result.keypoints) > 0:
@@ -142,9 +142,11 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                 buf_norm = normalize_keypoints(buf, frame_w, frame_h)
 
                 # MotionBERT inference
+                t_mb = time.perf_counter()
                 input_tensor = torch.from_numpy(buf_norm).unsqueeze(0).to(DEVICE)
                 with torch.no_grad():
                     pred_3d = motionbert(input_tensor)
+                dt_mb = (time.perf_counter() - t_mb) * 1000
 
                 center_idx = min(len(kpts_buffer) - 1, CLIP_LEN // 2)
                 pad_count = CLIP_LEN - len(kpts_buffer)
@@ -154,9 +156,15 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                 # Root-relative
                 joints_3d = joints_3d - joints_3d[0:1]
                 response['joints_3d'] = joints_3d.tolist()
+
+                dt_total = (time.perf_counter() - t_recv) * 1000
+                print(f'[{addr}] Frame {frame_count}: YOLO {dt_yolo:.1f}ms  '
+                      f'MotionBERT {dt_mb:.1f}ms  total {dt_total:.1f}ms  '
+                      f'buffer {len(kpts_buffer)}/{CLIP_LEN}')
             else:
                 response['coco_keypoints'] = None
                 response['joints_3d'] = None
+                print(f'[{addr}] Frame {frame_count}: YOLO {dt_yolo:.1f}ms  no person detected')
 
             # Update display with inference results (overlay + 3D)
             if show_display:
@@ -218,6 +226,11 @@ def main():
 
     if show_display:
         print('Display enabled. Press q in any window to quit.')
+        # Initialize Qt/OpenCV in the main thread BEFORE any worker threads
+        # start. Worker threads call cv2 (imdecode, drawing) and YOLO calls
+        # OpenCV internally — if Qt is first touched there, imshow in the
+        # main thread later triggers QObject::moveToThread errors.
+        cv2.waitKey(1)
 
     try:
         # Accept clients in a background thread so main thread can run display
