@@ -48,8 +48,9 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Shared display state — written by client handler, read by main thread
 display_lock = threading.Lock()
 display_state = {
-    'frame': None,        # BGR frame with 2D overlay
-    'skeleton_img': None, # rendered 3D skeleton
+    'frame': None,        # latest raw decoded frame (updated immediately)
+    'overlay_frame': None, # frame with 2D skeleton drawn on it
+    'skeleton_img': None,  # rendered 3D skeleton
 }
 
 
@@ -101,6 +102,12 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
             if frame is None:
                 continue
 
+            # Immediately update display with the raw frame so the video
+            # stream stays smooth regardless of inference speed.
+            if show_display:
+                with display_lock:
+                    display_state['frame'] = frame.copy()
+
             # YOLOv8-pose detection
             results = yolo(frame, verbose=False)
             result = results[0]
@@ -151,13 +158,13 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                 response['coco_keypoints'] = None
                 response['joints_3d'] = None
 
-            # Update shared display state
+            # Update display with inference results (overlay + 3D)
             if show_display:
                 skeleton_img = None
                 if joints_3d is not None:
                     skeleton_img = render_3d_to_image(fig, ax, joints_3d)
                 with display_lock:
-                    display_state['frame'] = frame.copy()
+                    display_state['overlay_frame'] = frame.copy()
                     display_state['skeleton_img'] = skeleton_img
 
             # Send JSON response
@@ -173,6 +180,7 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
         if show_display:
             with display_lock:
                 display_state['frame'] = None
+                display_state['overlay_frame'] = None
                 display_state['skeleton_img'] = None
         print(f'Client disconnected: {addr}')
 
@@ -234,14 +242,17 @@ def main():
             while True:
                 with display_lock:
                     frame = display_state['frame']
+                    overlay = display_state['overlay_frame']
                     skeleton_img = display_state['skeleton_img']
 
                 if frame is not None:
                     cv2.imshow('Server - Received Stream', frame)
+                if overlay is not None:
+                    cv2.imshow('Server - 2D Overlay', overlay)
                 if skeleton_img is not None:
                     cv2.imshow('Server - 3D Skeleton', skeleton_img)
 
-                key = cv2.waitKey(30) & 0xFF
+                key = cv2.waitKey(10) & 0xFF
                 if key == ord('q'):
                     break
             cv2.destroyAllWindows()
