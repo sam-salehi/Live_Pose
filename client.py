@@ -24,8 +24,33 @@ import matplotlib.pyplot as plt
 from live_pose3d import (
     draw_2d_skeleton,
     update_3d_plot,
+    normalize_to_body_frame,
+    arm_elevation_angle,
 )
 from protocol import send_msg, recv_msg, pack_frame
+
+# Smoothing factor for the displayed shoulder angles (0 = no update, 1 = no smoothing).
+ANGLE_EMA_ALPHA = 0.25
+
+
+def draw_corner_label(frame, text, corner='top-left', y_row=0,
+                      color=(0, 255, 255), scale=0.8, thickness=2,
+                      margin=10, row_height=35):
+    """
+    Draw `text` anchored to a corner of `frame`. `y_row` stacks multiple
+    labels vertically (0 = first row, 1 = below it, etc.).
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+    h, w = frame.shape[:2]
+    y = margin + th + y_row * row_height
+    if corner == 'top-left':
+        x = margin
+    elif corner == 'top-right':
+        x = w - tw - margin
+    else:
+        raise ValueError(f'Unsupported corner: {corner}')
+    cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
 def render_3d_to_image(fig, ax, joints_3d):
@@ -42,6 +67,8 @@ def main():
     parser.add_argument('--server-ip', required=True, help='Server IP address')
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--jpeg-quality', type=int, default=80)
+    parser.add_argument('--debug', action='store_true',
+                        help='Show body-frame arm components for angle debugging')
     args = parser.parse_args()
 
     # Connect to server
@@ -102,6 +129,14 @@ def main():
     fps_display = 0.0
     skeleton_img = None
 
+    # Smoothed shoulder-vs-coronal-plane angles (degrees, signed).
+    ema_left_angle = None
+    ema_right_angle = None
+
+    # Debug: latest body-frame upper-arm vectors.
+    last_left_arm_body = None
+    last_right_arm_body = None
+
     try:
         while running:
             ret, frame = cap.read()
@@ -131,6 +166,29 @@ def main():
             if joints_3d is not None:
                 skeleton_img = render_3d_to_image(fig, ax, joints_3d)
 
+                # Elevation angle: 0 = arm hanging, 90 = horizontal in any
+                # direction, 180 = straight overhead. Uses body-frame Z, which
+                # is mostly aligned with image-vertical (robust axis).
+                body = normalize_to_body_frame(joints_3d)
+                last_left_arm_body = body[12] - body[11]   # L elbow - L shoulder
+                last_right_arm_body = body[15] - body[14]  # R elbow - R shoulder
+                left_raw = arm_elevation_angle(
+                    body, side='left', already_normalized=True
+                )
+                right_raw = arm_elevation_angle(
+                    body, side='right', already_normalized=True
+                )
+                ema_left_angle = (
+                    left_raw if ema_left_angle is None
+                    else ANGLE_EMA_ALPHA * left_raw
+                         + (1.0 - ANGLE_EMA_ALPHA) * ema_left_angle
+                )
+                ema_right_angle = (
+                    right_raw if ema_right_angle is None
+                    else ANGLE_EMA_ALPHA * right_raw
+                         + (1.0 - ANGLE_EMA_ALPHA) * ema_right_angle
+                )
+
             # FPS counter
             fps_counter += 1
             elapsed = time.time() - fps_time
@@ -139,10 +197,48 @@ def main():
                 fps_counter = 0
                 fps_time = time.time()
 
-            cv2.putText(
-                frame, f'FPS: {fps_display:.1f}', (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+            # Overlay: FPS + left shoulder angle in top-left,
+            # right shoulder angle in top-right.
+            draw_corner_label(
+                frame, f'FPS: {fps_display:.1f}',
+                corner='top-left', y_row=0,
+                color=(0, 255, 0), scale=1.0,
             )
+            left_txt = (
+                f'L Elev: {ema_left_angle:5.1f} deg'
+                if ema_left_angle is not None else 'L Elev:   -- deg'
+            )
+            right_txt = (
+                f'R Elev: {ema_right_angle:5.1f} deg'
+                if ema_right_angle is not None else 'R Elev:   -- deg'
+            )
+            draw_corner_label(
+                frame, left_txt, corner='top-left', y_row=1,
+                scale=1.4, thickness=3, row_height=55,
+            )
+            draw_corner_label(
+                frame, right_txt, corner='top-right', y_row=0,
+                scale=1.4, thickness=3, row_height=55,
+            )
+
+            if args.debug:
+                def _fmt(v):
+                    if v is None:
+                        return 'x=--   y=--   z=--'
+                    return f'x={v[0]:+.2f} y={v[1]:+.2f} z={v[2]:+.2f}'
+
+                draw_corner_label(
+                    frame, 'L arm body: ' + _fmt(last_left_arm_body),
+                    corner='top-left', y_row=2,
+                    scale=0.6, thickness=2, row_height=55,
+                    color=(255, 255, 255),
+                )
+                draw_corner_label(
+                    frame, 'R arm body: ' + _fmt(last_right_arm_body),
+                    corner='top-right', y_row=1,
+                    scale=0.6, thickness=2, row_height=55,
+                    color=(255, 255, 255),
+                )
 
             cv2.imshow('Remote Pose (press q to quit)', frame)
             if skeleton_img is not None:
