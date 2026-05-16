@@ -266,6 +266,34 @@ def arm_elevation_angle(joints_3d, side='right', already_normalized=False):
     return float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
 
 
+def elbow_included_angle_deg(joints_3d, side='right'):
+    """
+    Included angle at the elbow between upper arm and forearm (3D).
+
+    Uses vectors from the elbow toward the shoulder and toward the wrist.
+    Translation-invariant and rotation-invariant, so any consistent joint
+    frame (e.g. root-relative MotionBERT output) is fine.
+
+    Interpretation (degrees, [0, 180]):
+        ~180  -> arm straight (fully extended at the elbow)
+        ~90   -> right-angle bend
+        small -> strongly bent / folded
+
+    H36M indices: L 11-12-13, R 14-15-16.
+    """
+    if side == 'right':
+        sh, el, wr = 14, 15, 16
+    else:
+        sh, el, wr = 11, 12, 13
+
+    v_upper = joints_3d[sh] - joints_3d[el]
+    v_fore = joints_3d[wr] - joints_3d[el]
+    nu = float(np.linalg.norm(v_upper)) + 1e-8
+    nf = float(np.linalg.norm(v_fore)) + 1e-8
+    cos_t = float(np.dot(v_upper, v_fore)) / (nu * nf)
+    return float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
+
+
 def shoulder_to_elbow_angle_with_body_plane(joints_3d, side='right',
                                             already_normalized=False):
     """
