@@ -148,10 +148,9 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
                     pred_3d = motionbert(input_tensor)
                 dt_mb = (time.perf_counter() - t_mb) * 1000
 
-                center_idx = min(len(kpts_buffer) - 1, CLIP_LEN // 2)
-                pad_count = CLIP_LEN - len(kpts_buffer)
-                frame_idx = pad_count + center_idx
-                joints_3d = pred_3d[0, frame_idx].cpu().numpy()
+                # Always take the last slot: left-padding means index CLIP_LEN-1
+                # is always the most recent frame, keeping 3D in sync with 2D.
+                joints_3d = pred_3d[0, CLIP_LEN - 1].cpu().numpy()
 
                 # Root-relative
                 joints_3d = joints_3d - joints_3d[0:1]
@@ -181,6 +180,9 @@ def handle_client(conn, addr, yolo, motionbert, mb_args, show_display):
 
     except (ConnectionResetError, BrokenPipeError):
         pass
+    except Exception as e:
+        print(f'[{addr}] Error: {e}', flush=True)
+        import traceback; traceback.print_exc()
     finally:
         plt.close(fig)
         conn.close()
