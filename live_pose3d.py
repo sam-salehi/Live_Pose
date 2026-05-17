@@ -15,7 +15,8 @@ import torch
 import torch.nn as nn
 from functools import partial
 import matplotlib
-matplotlib.use('TkAgg')
+if __name__ == '__main__':
+    matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from ultralytics import YOLO
