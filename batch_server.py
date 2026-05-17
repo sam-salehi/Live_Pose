@@ -86,7 +86,6 @@ def process_video(video_path, yolo, motionbert):
     print(f'  2D detection complete: {len(all_h36m)} frames')
 
     # Second pass: run MotionBERT with sliding window
-    # Fill None gaps with nearest valid frame for the buffer
     all_joints_3d = []
     kpts_buffer = deque(maxlen=CLIP_LEN)
 
@@ -106,9 +105,8 @@ def process_video(video_path, yolo, motionbert):
             with torch.no_grad():
                 pred_3d = motionbert(input_tensor)
 
-            center_idx = min(len(kpts_buffer) - 1, CLIP_LEN // 2)
-            pad_count = CLIP_LEN - len(kpts_buffer)
-            fidx = pad_count + center_idx
+            # Always read the last position (most recent frame) to stay in sync.
+            fidx = CLIP_LEN - 1
             joints_3d = pred_3d[0, fidx].cpu().numpy()
             joints_3d = joints_3d - joints_3d[0:1]  # root-relative
             all_joints_3d.append(joints_3d.tolist())
