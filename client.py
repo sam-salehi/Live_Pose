@@ -19,13 +19,10 @@ import time
 
 import numpy as np
 import cv2
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend — no Tk, no GIL issues
-import matplotlib.pyplot as plt
 
 from live_pose3d import (
     draw_2d_skeleton,
-    update_3d_plot,
+    H36M_BONES,
     normalize_to_body_frame,
     arm_elevation_angle,
     elbow_included_angle_deg,
@@ -62,13 +59,40 @@ def draw_corner_label(frame, text, corner='top-left', y_row=0,
     cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
-def render_3d_to_image(fig, ax, joints_3d):
-    """Render 3D skeleton to a BGR numpy image via the Agg backend."""
-    update_3d_plot(ax, joints_3d)
-    fig.canvas.draw()
-    buf = fig.canvas.buffer_rgba()
-    img = np.asarray(buf)                     # RGBA
-    return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+def render_3d_cv(joints_3d, img_size=500):
+    """
+    Render 3D skeleton to a BGR image using OpenCV drawing (~1ms).
+    Uses a simple rotated orthographic projection for a 3/4 view.
+    """
+    img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+
+    # Remap axes for display: X=x, Y=z (depth), Z=-y (up) — same as the
+    # old matplotlib view.
+    x = joints_3d[:, 0]
+    y = joints_3d[:, 2]
+    z = -joints_3d[:, 1]
+
+    # Simple 3/4 rotation around vertical for depth cue
+    angle = np.radians(25)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    px = x * cos_a + y * sin_a
+    py = z  # vertical stays vertical
+
+    # Scale and center
+    scale = img_size * 0.35
+    cx, cy = img_size // 2, img_size // 2
+    sx = (px * scale + cx).astype(int)
+    sy = (-py * scale + cy).astype(int)  # flip so +Z is up
+
+    # Draw bones
+    for (i, j) in H36M_BONES:
+        cv2.line(img, (sx[i], sy[i]), (sx[j], sy[j]), (255, 200, 0), 2)
+
+    # Draw joints
+    for k in range(17):
+        cv2.circle(img, (sx[k], sy[k]), 4, (0, 0, 255), -1)
+
+    return img
 
 
 def main():
@@ -115,11 +139,6 @@ def main():
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f'Webcam: {frame_w}x{frame_h}')
-
-    # Matplotlib 3D figure (offscreen via Agg)
-    fig = plt.figure(figsize=(5, 5), dpi=100)
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_title('Waiting for pose...')
 
     # Shared state between threads
     latest_result = {'coco_keypoints': None, 'joints_3d': None}
@@ -204,7 +223,7 @@ def main():
                 draw_2d_skeleton(frame, coco_kpts)
 
             if joints_3d is not None:
-                skeleton_img = render_3d_to_image(fig, ax, joints_3d)
+                skeleton_img = render_3d_cv(joints_3d)
 
                 # Elevation angle: 0 = arm hanging, 90 = horizontal in any
                 # direction, 180 = straight overhead. Uses body-frame Z, which
@@ -358,7 +377,6 @@ def main():
         running = False
         cap.release()
         cv2.destroyAllWindows()
-        plt.close('all')
         sock.close()
         print('Done.')
 
