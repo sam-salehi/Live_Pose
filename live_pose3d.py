@@ -165,6 +165,164 @@ def normalize_keypoints(kpts_buffer, frame_w, frame_h):
     return motion.astype(np.float32)
 
 
+def normalize_to_body_frame(joints_3d, scale_by_torso=False):
+    """
+    Rotate and translate 3D joints into a body-fixed coordinate frame.
+
+    Axes (right-handed):
+      X: left hip  -> right hip   (lateral)
+      Z: hip center -> neck       (vertical, made orthogonal to X)
+      Y: Z x X                    (forward, out of chest)
+
+    Origin is the hip center (H36M joint 0). The frame is rebuilt from the
+    pose itself, so the result is invariant to camera orientation and to the
+    subject rotating around the vertical axis.
+
+    Args:
+        joints_3d: (17, 3) H36M joints, in any consistent world frame.
+        scale_by_torso: if True, also divide all coordinates by the torso
+            length (distance from hip center to neck) so the pose is
+            scale-normalized.
+
+    Returns:
+        (17, 3) joints expressed in the body frame.
+    """
+    hip_c = joints_3d[0]
+    r_hip = joints_3d[1]
+    l_hip = joints_3d[4]
+    neck  = joints_3d[8]
+
+    # X: left hip -> right hip
+    x_raw = r_hip - l_hip
+    x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
+
+    # Z: hip center -> neck, orthogonalized against X (Gram-Schmidt)
+    z_raw = neck - hip_c
+    z_raw = z_raw - np.dot(z_raw, x_axis) * x_axis
+    z_axis = z_raw / (np.linalg.norm(z_raw) + 1e-8)
+
+    # Y: Z x X (forward)
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
+
+    # Rows of R are body axes in world coords => v_body = (v_world - origin) @ R.T
+    R = np.stack([x_axis, y_axis, z_axis], axis=0).astype(np.float32)
+
+    centered = (joints_3d - hip_c[None, :]).astype(np.float32)
+    normalized = centered @ R.T
+
+    if scale_by_torso:
+        torso_len = np.linalg.norm(neck - hip_c) + 1e-8
+        normalized = normalized / torso_len
+
+    return normalized
+
+
+def angle_with_xz_plane(vec):
+    """
+    Signed angle (degrees) between a 3D vector and the XZ plane.
+
+    The XZ plane has Y as its normal, so the angle is simply
+        arcsin(vec_y / ||vec||)
+    in [-90, 90]. Positive -> vector points in +Y (out of chest in the
+    body frame), negative -> -Y (behind the body), 0 -> vector lies in
+    the plane.
+    """
+    vec = np.asarray(vec, dtype=np.float32)
+    norm = np.linalg.norm(vec) + 1e-8
+    sin_theta = vec[1] / norm
+    return float(np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0))))
+
+
+def arm_elevation_angle(joints_3d, side='right', already_normalized=False):
+    """
+    Angle (degrees, [0, 180]) between the upper arm and the body's
+    downward direction (-Z in the body-fixed frame built by
+    `normalize_to_body_frame`).
+
+    Independent of which way the arm is raised — only the magnitude of
+    the lift matters:
+          0  -> arm at rest, hanging along the spine
+         90  -> arm raised horizontally in any direction
+                (sideways, forward, backward)
+        180  -> arm straight overhead
+
+    Because the metric uses only the body-frame Z component (which is
+    closely aligned with image-vertical, the most reliable monocular
+    axis), it is far more stable than measures that depend on the depth
+    direction.
+
+    Args:
+        joints_3d: (17, 3) H36M joints. By default they are normalized
+            into the body frame internally.
+        side: 'right' or 'left'.
+        already_normalized: set True if `joints_3d` is already body-frame.
+    """
+    body = joints_3d if already_normalized else normalize_to_body_frame(joints_3d)
+    sh_idx, el_idx = (14, 15) if side == 'right' else (11, 12)
+    arm = body[el_idx] - body[sh_idx]
+    norm = float(np.linalg.norm(arm)) + 1e-8
+    cos_t = -arm[2] / norm  # angle with -Z (rest direction)
+    return float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
+
+
+def elbow_included_angle_deg(joints_3d, side='right'):
+    """
+    Included angle at the elbow between upper arm and forearm (3D).
+
+    Uses vectors from the elbow toward the shoulder and toward the wrist.
+    Translation-invariant and rotation-invariant, so any consistent joint
+    frame (e.g. root-relative MotionBERT output) is fine.
+
+    Interpretation (degrees, [0, 180]):
+        ~180  -> arm straight (fully extended at the elbow)
+        ~90   -> right-angle bend
+        small -> strongly bent / folded
+
+    H36M indices: L 11-12-13, R 14-15-16.
+    """
+    if side == 'right':
+        sh, el, wr = 14, 15, 16
+    else:
+        sh, el, wr = 11, 12, 13
+
+    v_upper = joints_3d[sh] - joints_3d[el]
+    v_fore = joints_3d[wr] - joints_3d[el]
+    nu = float(np.linalg.norm(v_upper)) + 1e-8
+    nf = float(np.linalg.norm(v_fore)) + 1e-8
+    cos_t = float(np.dot(v_upper, v_fore)) / (nu * nf)
+    return float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
+
+
+def shoulder_to_elbow_angle_with_body_plane(joints_3d, side='right',
+                                            already_normalized=False):
+    """
+    Angle the upper arm (shoulder -> elbow) makes with the body's XZ plane
+    (the coronal / frontal plane) in the body-fixed frame built by
+    `normalize_to_body_frame`. Origin of that frame is the pelvis.
+
+    Interpretation (degrees, range [-90, 90]):
+          0  -> arm lies in the coronal plane
+                 (e.g. hanging straight down, or out to the side at shoulder height)
+        +deg -> arm reaches forward (out of the chest)
+        -deg -> arm reaches backward
+
+    Args:
+        joints_3d: (17, 3) H36M joints. By default these are taken in the
+            raw MotionBERT/world frame and normalized internally.
+        side: 'right' or 'left'.
+        already_normalized: set True if `joints_3d` is already in the body
+            frame (skips re-normalization).
+
+    Returns:
+        float angle in degrees.
+    """
+    body = joints_3d if already_normalized else normalize_to_body_frame(joints_3d)
+    sh_idx, el_idx = (14, 15) if side == 'right' else (11, 12)
+    upper_arm = body[el_idx] - body[sh_idx]
+    return angle_with_xz_plane(upper_arm)
+
+
 def draw_2d_skeleton(frame, coco_kpts):
     """Draw COCO 2D skeleton on frame."""
     for i in range(17):
