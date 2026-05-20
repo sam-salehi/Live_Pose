@@ -30,10 +30,7 @@ else:
     matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-from live_pose3d import (
-    draw_2d_skeleton,
-    H36M_BONES,
-)
+from live_pose3d import update_3d_body_frame_plot
 from preprocessing import extract_motion_signals
 from protocol import send_msg, recv_msg
 
@@ -290,71 +287,6 @@ def extract_punch_features(p, speed, elbow_angle, elevation, reach,
     return feats
 
 
-def render_3d_cv(joints_3d, img_size=400):
-    """Render 3D skeleton with body-frame axes using OpenCV."""
-    img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-
-    # 3/4 view projection: swap axes so camera looks from an angle
-    x = joints_3d[:, 0]
-    y = joints_3d[:, 2]
-    z = -joints_3d[:, 1]
-
-    angle = np.radians(25)
-    cos_a, sin_a = np.cos(angle), np.sin(angle)
-    px = x * cos_a + y * sin_a
-    py = z
-
-    scale = img_size * 0.35
-    cx, cy = img_size // 2, img_size // 2
-    sx = (px * scale + cx).astype(int)
-    sy = (-py * scale + cy).astype(int)
-
-    # Draw skeleton
-    for (i, j) in H36M_BONES:
-        cv2.line(img, (sx[i], sy[i]), (sx[j], sy[j]), (255, 200, 0), 2)
-    for k in range(17):
-        cv2.circle(img, (sx[k], sy[k]), 4, (0, 0, 255), -1)
-
-    # Draw body-frame axes at hip center (joint 0)
-    # Reconstruct body-frame axes in world coords
-    hip_c = joints_3d[0]
-    r_hip = joints_3d[1]
-    l_hip = joints_3d[4]
-    neck  = joints_3d[8]
-
-    x_raw = r_hip - l_hip
-    x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
-    z_raw = neck - hip_c
-    z_raw = z_raw - np.dot(z_raw, x_axis) * x_axis
-    z_axis = z_raw / (np.linalg.norm(z_raw) + 1e-8)
-    y_axis = np.cross(z_axis, x_axis)
-    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
-
-    # Project axis endpoints using the same 3/4 view
-    axis_len = np.linalg.norm(neck - hip_c) * 0.6
-    origin = hip_c
-    axes_info = [
-        (x_axis, (0, 0, 255),   'X'),  # red   = lateral
-        (y_axis, (0, 255, 0),   'Y'),  # green = forward
-        (z_axis, (255, 100, 0), 'Z'),  # blue  = vertical
-    ]
-
-    def project_pt(pt):
-        px_ = pt[0] * cos_a + pt[2] * sin_a
-        py_ = -pt[1]
-        return (int(px_ * scale + cx), int(-py_ * scale + cy))
-
-    o2d = project_pt(origin)
-    for axis_vec, color, label in axes_info:
-        tip = origin + axis_vec * axis_len
-        t2d = project_pt(tip)
-        cv2.arrowedLine(img, o2d, t2d, color, 2, tipLength=0.2)
-        cv2.putText(img, label, (t2d[0] + 4, t2d[1] - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-
-    return img
-
-
 def main():
     parser = argparse.ArgumentParser(description='Batch video analysis with velocity plots')
     parser.add_argument('--server-ip', default=None, help='Batch server IP address')
@@ -437,6 +369,8 @@ def main():
 
     # Body-frame motion signals (normalization in preprocessing.py)
     sig = extract_motion_signals(all_joints, video_fps)
+    body_frame = sig['body_frame']
+    R_clip = sig['R_clip']
     left_vel = sig['left_vel']
     right_vel = sig['right_vel']
     left_elev = sig['left_elev']
@@ -690,6 +624,12 @@ def main():
     fig.tight_layout()
     fig.show()
 
+    # Matplotlib 3D: pelvis-relative pose + per-frame body axes (not clip-rotated body frame)
+    fig_3d = plt.figure('3D Clip Frame + Relative Axes', figsize=(6, 6))
+    ax_3d = fig_3d.add_subplot(111, projection='3d')
+    fig_3d.tight_layout()
+    fig_3d.show()
+
     # Playback: open video again and step through with pose overlay
     cap = cv2.VideoCapture(video_path)
     frame_delay = int(1000.0 / video_fps)
@@ -697,6 +637,7 @@ def main():
     PLOT_UPDATE_EVERY = 3  # update plots every N frames to keep playback smooth
 
     print('Playing back with pose overlay... Press q to stop.')
+    print('  3D view: clip-frame skeleton; X\'Y\'Z\' axes rotate per frame. Press q in video to stop.')
 
     try:
         while True:
@@ -704,17 +645,15 @@ def main():
             if not ret:
                 break
 
-            # Draw skeleton overlay
-            skeleton_img = None
             if frame_idx < len(all_joints) and all_joints[frame_idx] is not None:
                 j3d = np.array(all_joints[frame_idx], dtype=np.float32)
-                skeleton_img = render_3d_cv(j3d)
+                update_3d_body_frame_plot(ax_3d, j3d, body_frame[frame_idx], R_clip)
+                fig_3d.canvas.draw_idle()
+                fig_3d.canvas.flush_events()
 
             cv2.putText(frame, f'Frame: {frame_idx}', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imshow('Video Playback', frame)
-            if skeleton_img is not None:
-                cv2.imshow('3D Skeleton', skeleton_img)
 
             # Update plot progress
             if frame_idx % PLOT_UPDATE_EVERY == 0 and frame_idx < len(left_vel):

@@ -53,6 +53,44 @@ def stack_poses(all_joints):
     return poses
 
 
+def clip_body_frame_rotation(poses):
+    """
+  Rotation matrix for the clip-stable (absolute) body frame.
+
+    Rows are [X, Y, Z] unit axes from the median pose.  For pelvis-centred
+    row vectors ``v``, clip coordinates are ``v @ R.T``.
+
+    Parameters
+    ----------
+    poses : ndarray, shape (T, 17, 3)
+        Root-relative MotionBERT joints (pelvis-centred per frame).
+
+    Returns
+    -------
+    ndarray, shape (3, 3)
+        ``R_clip``, or identity if the pose is degenerate.
+    """
+    poses = np.asarray(poses, dtype=np.float64)
+    q = poses - poses[:, [_PELVIS], :]
+    med = np.median(q, axis=0)
+
+    x_raw = med[_R_HIP] - med[_L_HIP]
+    xn = np.linalg.norm(x_raw)
+    if xn < 1e-8:
+        return np.eye(3, dtype=np.float32)
+
+    x_hat = x_raw / xn
+    z_raw = med[_THORAX] - med[_PELVIS]
+    z_raw -= np.dot(z_raw, x_hat) * x_hat
+    zn = np.linalg.norm(z_raw)
+    if zn < 1e-8:
+        return np.eye(3, dtype=np.float32)
+
+    z_hat = z_raw / zn
+    y_hat = np.cross(z_hat, x_hat)
+    return np.stack([x_hat, y_hat, z_hat], axis=0).astype(np.float32)
+
+
 def poses_to_body_frame_clip(poses):
     """
     Map a pose sequence into one clip-stable body frame (torso-normalised).
@@ -73,26 +111,11 @@ def poses_to_body_frame_clip(poses):
     """
     poses = np.asarray(poses, dtype=np.float64)
     q = poses - poses[:, [_PELVIS], :]
-
-    med = np.median(q, axis=0)
-
-    x_raw = med[_R_HIP] - med[_L_HIP]
-    xn = np.linalg.norm(x_raw)
-    if xn < 1e-8:
+    R = clip_body_frame_rotation(poses).astype(np.float64)
+    if np.allclose(R, np.eye(3)):
         return q.astype(np.float32)
-    x_hat = x_raw / xn
 
-    z_raw = med[_THORAX] - med[_PELVIS]
-    z_raw -= np.dot(z_raw, x_hat) * x_hat
-    zn = np.linalg.norm(z_raw)
-    if zn < 1e-8:
-        return q.astype(np.float32)
-    z_hat = z_raw / zn
-    y_hat = np.cross(z_hat, x_hat)
-
-    R = np.stack([x_hat, y_hat, z_hat])
     q = q @ R.T
-
     torso = float(np.median(np.linalg.norm(q[:, _THORAX] - q[:, _PELVIS], axis=-1)))
     if torso > 1e-6:
         q /= torso
@@ -158,6 +181,7 @@ def extract_motion_signals(all_joints, fps):
         left_speed, right_speed, body_frame (T, 17, 3).
     """
     poses = stack_poses(all_joints)
+    R_clip = clip_body_frame_rotation(poses)
     body = poses_to_body_frame_clip(poses)
     T = body.shape[0]
     dt = 1.0 / fps
@@ -213,4 +237,5 @@ def extract_motion_signals(all_joints, fps):
         'left_speed': np.linalg.norm(left_vel, axis=1),
         'right_speed': np.linalg.norm(right_vel, axis=1),
         'body_frame': body,
+        'R_clip': R_clip,
     }

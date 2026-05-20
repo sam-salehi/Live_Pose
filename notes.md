@@ -37,7 +37,6 @@ Some temporal:
 
 
 
-
 ## Preprocessing steps:
 1. Smooth joint positions in root relative 3d using Savitzky Golay. 
 2. Swithces in basis modify speed calculations. Speed calculations should be made absolute. (Need to stabalize body frame)

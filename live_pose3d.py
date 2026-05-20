@@ -166,6 +166,46 @@ def normalize_keypoints(kpts_buffer, frame_w, frame_h):
     return motion.astype(np.float32)
 
 
+def compute_body_frame_axes(joints_3d):
+    """
+    Per-frame right-handed body axes in the same space as ``joints_3d``.
+
+    X: left hip -> right hip (lateral)
+    Z: pelvis -> neck, orthogonalized to X (torso "up")
+    Y: Z x X (forward); **not** X x Z (that points backward)
+
+    Returns
+    -------
+    x_axis, y_axis, z_axis : (3,) unit vectors
+    hip_c : (3,) pelvis / hip center
+    torso_len : float, ||neck - hip||
+    """
+    joints_3d = np.asarray(joints_3d, dtype=np.float64)
+    hip_c = joints_3d[0]
+    r_hip = joints_3d[1]
+    l_hip = joints_3d[4]
+    neck = joints_3d[8]
+
+    x_raw = r_hip - l_hip
+    x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
+
+    z_raw = neck - hip_c
+    z_raw = z_raw - np.dot(z_raw, x_axis) * x_axis
+    z_axis = z_raw / (np.linalg.norm(z_raw) + 1e-8)
+
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
+
+    torso_len = float(np.linalg.norm(neck - hip_c))
+    return (
+        x_axis.astype(np.float32),
+        y_axis.astype(np.float32),
+        z_axis.astype(np.float32),
+        hip_c.astype(np.float32),
+        torso_len,
+    )
+
+
 def normalize_to_body_frame(joints_3d, scale_by_torso=False):
     """
     Rotate and translate 3D joints into a body-fixed coordinate frame.
@@ -188,23 +228,7 @@ def normalize_to_body_frame(joints_3d, scale_by_torso=False):
     Returns:
         (17, 3) joints expressed in the body frame.
     """
-    hip_c = joints_3d[0]
-    r_hip = joints_3d[1]
-    l_hip = joints_3d[4]
-    neck  = joints_3d[8]
-
-    # X: left hip -> right hip
-    x_raw = r_hip - l_hip
-    x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
-
-    # Z: hip center -> neck, orthogonalized against X (Gram-Schmidt)
-    z_raw = neck - hip_c
-    z_raw = z_raw - np.dot(z_raw, x_axis) * x_axis
-    z_axis = z_raw / (np.linalg.norm(z_raw) + 1e-8)
-
-    # Y: Z x X (forward)
-    y_axis = np.cross(z_axis, x_axis)
-    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
+    x_axis, y_axis, z_axis, hip_c, torso_len = compute_body_frame_axes(joints_3d)
 
     # Rows of R are body axes in world coords => v_body = (v_world - origin) @ R.T
     R = np.stack([x_axis, y_axis, z_axis], axis=0).astype(np.float32)
@@ -213,8 +237,7 @@ def normalize_to_body_frame(joints_3d, scale_by_torso=False):
     normalized = centered @ R.T
 
     if scale_by_torso:
-        torso_len = np.linalg.norm(neck - hip_c) + 1e-8
-        normalized = normalized / torso_len
+        normalized = normalized / (torso_len + 1e-8)
 
     return normalized
 
@@ -338,7 +361,7 @@ def draw_2d_skeleton(frame, coco_kpts):
 
 
 def update_3d_plot(ax, joints_3d):
-    """Update the 3D matplotlib plot with new joint positions."""
+    """Update the 3D matplotlib plot with new joint positions (raw model coords)."""
     ax.cla()
     ax.set_xlim(-1, 1)
     ax.set_ylim(-1, 1)
@@ -357,6 +380,86 @@ def update_3d_plot(ax, joints_3d):
     ax.scatter(x, y, z, c='red', s=20)
     for (i, j) in H36M_BONES:
         ax.plot([x[i], x[j]], [y[i], y[j]], [z[i], z[j]], c='blue', linewidth=2)
+
+
+def update_3d_body_frame_plot(ax, joints_raw, joints_clip, R_clip, axis_arm=None):
+    """
+    Matplotlib 3D: skeleton in clip-stable (absolute) frame; axes per-frame (relative).
+
+    Parameters
+    ----------
+    joints_raw : (17, 3)
+        Root-relative MotionBERT pose for this frame (for instantaneous body axes).
+    joints_clip : (17, 3)
+        Same frame in clip body coordinates (``body_frame[t]``).
+    R_clip : (3, 3)
+        Clip rotation from ``clip_body_frame_rotation``; maps frame axes into clip space.
+    """
+    ax.cla()
+    joints_raw = np.asarray(joints_raw, dtype=np.float32)
+    joints_clip = np.asarray(joints_clip, dtype=np.float32)
+    R_clip = np.asarray(R_clip, dtype=np.float32)
+
+    x, y, z = joints_clip[:, 0], joints_clip[:, 1], joints_clip[:, 2]
+    o = joints_clip[0]
+
+    for i, j in H36M_BONES:
+        ax.plot(
+            [x[i], x[j]], [y[i], y[j]], [z[i], z[j]],
+            color='#FFC800', linewidth=2,
+        )
+    ax.scatter(x, y, z, c='red', s=28, depthshade=True)
+
+    # Per-frame body axes, expressed in the clip (absolute) coordinate system
+    x_ax, y_ax, z_ax, _, torso = compute_body_frame_axes(joints_raw)
+    x_ax = x_ax @ R_clip.T
+    y_ax = y_ax @ R_clip.T
+    z_ax = z_ax @ R_clip.T
+    if axis_arm is None:
+        axis_arm = 0.45
+
+    def _q(axis_vec, color):
+        ax.quiver(
+            o[0], o[1], o[2],
+            axis_vec[0] * axis_arm, axis_vec[1] * axis_arm, axis_vec[2] * axis_arm,
+            color=color, linewidth=2, arrow_length_ratio=0.12,
+        )
+        return o + axis_vec * axis_arm * 1.08
+
+    tx = _q(x_ax, 'red')
+    ty = _q(y_ax, 'green')
+    tz = _q(z_ax, '#FF6400')
+    ax.text(tx[0], tx[1], tx[2], "X'", color='red', fontsize=10)
+    ax.text(ty[0], ty[1], ty[2], "Y'", color='green', fontsize=10)
+    ax.text(tz[0], tz[1], tz[2], "Z'", color='#FF6400', fontsize=10)
+
+    # Fixed clip axes (absolute reference, faint)
+    ref = axis_arm * 0.85
+    ax.quiver(o[0], o[1], o[2], ref, 0, 0, color='gray', alpha=0.35, linewidth=1,
+              arrow_length_ratio=0.1)
+    ax.quiver(o[0], o[1], o[2], 0, ref, 0, color='gray', alpha=0.35, linewidth=1,
+              arrow_length_ratio=0.1)
+    ax.quiver(o[0], o[1], o[2], 0, 0, ref, color='gray', alpha=0.35, linewidth=1,
+              arrow_length_ratio=0.1)
+    ax.text(o[0] + ref, o[1], o[2], 'X', color='gray', fontsize=8, alpha=0.7)
+    ax.text(o[0], o[1] + ref, o[2], 'Y', color='gray', fontsize=8, alpha=0.7)
+    ax.text(o[0], o[1], o[2] + ref, 'Z', color='gray', fontsize=8, alpha=0.7)
+
+    lim = float(np.max(np.abs(joints_clip))) * 1.15 + 1e-3
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(-lim, lim)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except AttributeError:
+        pass
+
+    ax.set_xlabel('X clip (lateral)')
+    ax.set_ylabel('Y clip (forward)')
+    ax.set_zlabel('Z clip (up)')
+    ax.set_title('Clip frame skeleton + per-frame body axes (X\'Y\'Z\')')
+    ax.view_init(elev=22, azim=-58)
+    ax.grid(True, alpha=0.3)
 
 
 def main():
