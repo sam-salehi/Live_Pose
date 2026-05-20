@@ -8,16 +8,26 @@
 - detect punch occurence.
 - Classify puch
 
+## Ideas:
+- LLM assistant: https://arxiv.org/pdf/2405.20340
+- MotionBert seems to be bad with capturing hip rotation
+- Use VIT Pose instead of yolo
+- Since MOtionBert doesnt capture rotation well I put more trust in z axis and andlge dependant variables. Instead of curves.
 
 
 
 
 Metrics to use just consider left hand.
 
-Some during peak: (max length of arm)
-
-
-
+Peak / instant (clip body frame, left arm, @ elbow-peak ext): (coordinates in body frame_)
+elev_at_ext, elev_peak, elev_range
+elbow_at_ext, elbow_peak, elbow_range
+reach_at_ext, reach_peak
+wrist_to_head_at_ext
+wrist_z_at_ext
+fa_Z_frac, fa_elev_deg
+vel_Y_frac, vel_Z_frac (skip vel_X_frac as primary)
+xfactor_at_ext, sh_yaw_range
 
 Some temporal: 
 ** Important ** The path created: Straight line,  Curved upwards or curved sideways 
@@ -61,8 +71,6 @@ Elbow: Angle of the elbow
 
 
 ## Punch metrics:
-
-
 
 
 

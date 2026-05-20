@@ -74,7 +74,7 @@ def clip_body_frame_rotation(poses):
     q = poses - poses[:, [_PELVIS], :]
     med = np.median(q, axis=0)
 
-    x_raw = med[_R_HIP] - med[_L_HIP]
+    x_raw = med[_R_SHOULDER] - med[_L_SHOULDER]
     xn = np.linalg.norm(x_raw)
     if xn < 1e-8:
         return np.eye(3, dtype=np.float32)

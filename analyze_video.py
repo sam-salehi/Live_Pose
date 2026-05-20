@@ -31,7 +31,7 @@ else:
 import matplotlib.pyplot as plt
 
 from live_pose3d import update_3d_body_frame_plot
-from preprocessing import extract_motion_signals
+from preprocessing import extract_motion_signals, stack_poses, smooth_poses
 from protocol import send_msg, recv_msg
 
 
@@ -367,10 +367,14 @@ def main():
     print(f'{len(all_joints)} pose frames at {video_fps:.1f} FPS')
 
 
+    # Smooth raw poses before body-frame transform to reduce monocular jitter
+    raw_poses = stack_poses(all_joints)
+    smoothed_poses = smooth_poses(raw_poses)
+    smoothed_joints = [smoothed_poses[i] for i in range(len(smoothed_poses))]
+
     # Body-frame motion signals (normalization in preprocessing.py)
-    sig = extract_motion_signals(all_joints, video_fps)
+    sig = extract_motion_signals(smoothed_joints, video_fps)
     body_frame = sig['body_frame']
-    R_clip = sig['R_clip']
     left_vel = sig['left_vel']
     right_vel = sig['right_vel']
     left_elev = sig['left_elev']
@@ -647,7 +651,9 @@ def main():
 
             if frame_idx < len(all_joints) and all_joints[frame_idx] is not None:
                 j3d = np.array(all_joints[frame_idx], dtype=np.float32)
-                update_3d_body_frame_plot(ax_3d, j3d, body_frame[frame_idx], R_clip)
+                update_3d_body_frame_plot(
+                    ax_3d, body_frame[frame_idx], mirror_lr=True,
+                )
                 fig_3d.canvas.draw_idle()
                 fig_3d.canvas.flush_events()
 

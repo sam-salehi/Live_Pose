@@ -166,13 +166,23 @@ def normalize_keypoints(kpts_buffer, frame_w, frame_h):
     return motion.astype(np.float32)
 
 
-def compute_body_frame_axes(joints_3d):
+_L_SHOULDER = 11
+_R_SHOULDER = 14
+
+
+def compute_body_frame_axes(joints_3d, lateral='hips'):
     """
     Per-frame right-handed body axes in the same space as ``joints_3d``.
 
-    X: left hip -> right hip (lateral)
+    X: lateral (hips or shoulders — shoulders track torso yaw better in 3D lift)
     Z: pelvis -> neck, orthogonalized to X (torso "up")
     Y: Z x X (forward); **not** X x Z (that points backward)
+
+    Parameters
+    ----------
+    lateral : {'hips', 'shoulders'}
+        Use ``'shoulders'`` when hip line in the mesh barely moves during in-place
+        rotation (common in MotionBERT); shoulder line is more yaw-sensitive.
 
     Returns
     -------
@@ -182,11 +192,12 @@ def compute_body_frame_axes(joints_3d):
     """
     joints_3d = np.asarray(joints_3d, dtype=np.float64)
     hip_c = joints_3d[0]
-    r_hip = joints_3d[1]
-    l_hip = joints_3d[4]
     neck = joints_3d[8]
 
-    x_raw = r_hip - l_hip
+    if lateral == 'shoulders':
+        x_raw = joints_3d[_R_SHOULDER] - joints_3d[_L_SHOULDER]
+    else:
+        x_raw = joints_3d[1] - joints_3d[4]
     x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
 
     z_raw = neck - hip_c
@@ -382,23 +393,26 @@ def update_3d_plot(ax, joints_3d):
         ax.plot([x[i], x[j]], [y[i], y[j]], [z[i], z[j]], c='blue', linewidth=2)
 
 
-def update_3d_body_frame_plot(ax, joints_raw, joints_clip, R_clip, axis_arm=None):
+def update_3d_body_frame_plot(ax, joints_clip, axis_arm=None, mirror_lr=False):
     """
     Matplotlib 3D: skeleton in clip-stable (absolute) frame; axes per-frame (relative).
 
     Parameters
     ----------
-    joints_raw : (17, 3)
-        Root-relative MotionBERT pose for this frame (for instantaneous body axes).
     joints_clip : (17, 3)
-        Same frame in clip body coordinates (``body_frame[t]``).
-    R_clip : (3, 3)
-        Clip rotation from ``clip_body_frame_rotation``; maps frame axes into clip space.
+        Pose in clip body coordinates (``body_frame[t]``).  Primed axes are built
+        from this frame's shoulder line + torso in clip space so Y' moves when the
+        fighter turns in the video.
+    mirror_lr : bool
+        If True, invert the X axis so the skeleton matches a front-facing video
+        (person's right appears on the viewer's left, like real life).
     """
     ax.cla()
-    joints_raw = np.asarray(joints_raw, dtype=np.float32)
     joints_clip = np.asarray(joints_clip, dtype=np.float32)
-    R_clip = np.asarray(R_clip, dtype=np.float32)
+
+    if mirror_lr:
+        joints_clip = joints_clip.copy()
+        joints_clip[:, 0] *= -1  # negate X so left/right matches front-facing video
 
     x, y, z = joints_clip[:, 0], joints_clip[:, 1], joints_clip[:, 2]
     o = joints_clip[0]
@@ -410,13 +424,17 @@ def update_3d_body_frame_plot(ax, joints_raw, joints_clip, R_clip, axis_arm=None
         )
     ax.scatter(x, y, z, c='red', s=28, depthshade=True)
 
-    # Per-frame body axes, expressed in the clip (absolute) coordinate system
-    x_ax, y_ax, z_ax, _, torso = compute_body_frame_axes(joints_raw)
-    x_ax = x_ax @ R_clip.T
-    y_ax = y_ax @ R_clip.T
-    z_ax = z_ax @ R_clip.T
+    # Per-frame axes in clip space (from this frame's pose in clip coords — tracks rotation)
+    x_ax, y_ax, z_ax, _, torso = compute_body_frame_axes(
+        joints_clip, lateral='shoulders',
+    )
     if axis_arm is None:
         axis_arm = 0.45
+
+    clip_y = np.array([0.0, 1.0, 0.0])
+    yaw_off = float(np.degrees(np.arccos(
+        np.clip(np.dot(y_ax / (np.linalg.norm(y_ax) + 1e-8), clip_y), -1.0, 1.0),
+    )))
 
     def _q(axis_vec, color):
         ax.quiver(
@@ -457,7 +475,9 @@ def update_3d_body_frame_plot(ax, joints_raw, joints_clip, R_clip, axis_arm=None
     ax.set_xlabel('X clip (lateral)')
     ax.set_ylabel('Y clip (forward)')
     ax.set_zlabel('Z clip (up)')
-    ax.set_title('Clip frame skeleton + per-frame body axes (X\'Y\'Z\')')
+    ax.set_title(
+        f"Clip skeleton + X'Y'Z' (shoulders)  |  Y' vs clip Y: {yaw_off:.0f}°",
+    )
     ax.view_init(elev=22, azim=-58)
     ax.grid(True, alpha=0.3)
 
