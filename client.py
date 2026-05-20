@@ -61,7 +61,7 @@ def draw_corner_label(frame, text, corner='top-left', y_row=0,
 
 def render_3d_cv(joints_3d, img_size=500):
     """
-    Render 3D skeleton to a BGR image using OpenCV drawing (~1ms).
+    Render 3D skeleton with body-frame axes using OpenCV drawing (~1ms).
     Uses a simple rotated orthographic projection for a 3/4 view.
     """
     img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
@@ -91,6 +91,40 @@ def render_3d_cv(joints_3d, img_size=500):
     # Draw joints
     for k in range(17):
         cv2.circle(img, (sx[k], sy[k]), 4, (0, 0, 255), -1)
+
+    # Draw body-frame axes at hip center (joint 0)
+    hip_c = joints_3d[0]
+    r_hip = joints_3d[1]
+    l_hip = joints_3d[4]
+    neck  = joints_3d[8]
+
+    x_raw = r_hip - l_hip
+    x_axis = x_raw / (np.linalg.norm(x_raw) + 1e-8)
+    z_raw = neck - hip_c
+    z_raw = z_raw - np.dot(z_raw, x_axis) * x_axis
+    z_axis = z_raw / (np.linalg.norm(z_raw) + 1e-8)
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
+
+    axis_len = np.linalg.norm(neck - hip_c) * 0.6
+    axes_info = [
+        (x_axis, (0, 0, 255),   'X'),  # red   = lateral
+        (y_axis, (0, 255, 0),   'Y'),  # green = forward
+        (z_axis, (255, 100, 0), 'Z'),  # blue  = vertical
+    ]
+
+    def project_pt(pt):
+        px_ = pt[0] * cos_a + pt[2] * sin_a
+        py_ = -pt[1]
+        return (int(px_ * scale + cx), int(-py_ * scale + cy))
+
+    o2d = project_pt(hip_c)
+    for axis_vec, color, label in axes_info:
+        tip = hip_c + axis_vec * axis_len
+        t2d = project_pt(tip)
+        cv2.arrowedLine(img, o2d, t2d, color, 2, tipLength=0.2)
+        cv2.putText(img, label, (t2d[0] + 4, t2d[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     return img
 
