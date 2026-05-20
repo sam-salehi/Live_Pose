@@ -165,66 +165,77 @@ PUNCH_COLORS = {
 }
 
 
-def classify_punch(elevation, reach, start, end, fps,
-                    uppercut_elev_peak=70.0,
-                    jab_reach_peak=0.85):
+def classify_punch(elevation, elbow_angle, sh_yaw, start, end, fps,
+                    uppercut_elev_ext=44.0,
+                    hook_sh_yaw_range=11.0):
     """
     Classify a detected punch as jab, hook, or uppercut.
 
-    Uses two stance-independent features measured over the punch window:
+    Rules from ANOVA analysis of 1508 annotated punches (V4-V10):
+    Jab n=489, Lead Hook n=531, Lead Uppercut n=488.
 
-      1. Peak arm elevation (upper-arm angle from hanging):
-         Uppercuts keep the upper arm low (~23-27°) because the punch
-         drives upward from below. Jabs and hooks raise the arm to
-         horizontal or above (~90-125°).
-         → elev_peak < uppercut_elev_peak  →  UPPERCUT
+      1. Extension frame = frame of peak elbow angle in the window.
+         Arm elevation at that frame (elev_at_ext) cleanly separates
+         uppercuts (F=170): Jab=58°, Hook=51°, Uppercut=37°.
+         → elev_at_ext < uppercut_elev_ext  →  UPPERCUT
 
-      2. Peak reach (wrist-to-shoulder distance in torso-lengths):
-         Jabs fully extend the arm (~0.96). Hooks and uppercuts keep
-         the elbow bent, so reach stays lower (~0.75).
-         → reach_peak >= jab_reach_peak  →  JAB
-         → otherwise                     →  HOOK
+      2. Shoulder yaw range (shoulder rotation relative to hips = xfactor).
+         Hooks involve ~2x more shoulder rotation than jabs (F=138):
+         Hook=15°, Jab=7°.
+         → sh_yaw_range >= hook_sh_yaw_range  →  HOOK
+         → otherwise                          →  JAB
+
+    Note: reach_peak is nearly identical across all three classes
+    (F=0.86, p=0.43) on the full dataset and is no longer used.
 
     Parameters
     ----------
     elevation : ndarray, shape (N,)
-        Arm elevation angle per frame (degrees, 0=hanging, 90=horizontal).
-    reach : ndarray, shape (N,)
-        Wrist-to-shoulder distance per frame (torso-lengths).
+        Arm elevation per frame (degrees, 0=hanging, 90=horizontal).
+    elbow_angle : ndarray, shape (N,)
+        Elbow included angle per frame (degrees, 180=straight).
+    sh_yaw : ndarray, shape (N,)
+        Shoulder-vector angle in the hip-normalised body frame per frame
+        (degrees). Equals the shoulder-hip xfactor.
     start, end : int
-        Frame indices of the punch window.
+        Frame indices of the punch window (inclusive).
     fps : float
         Video frame rate (used for diagnostic output).
-    uppercut_elev_peak : float
-        If peak elevation in window < this, classify as uppercut.
-    jab_reach_peak : float
-        If peak reach in window >= this, classify as jab. Otherwise hook.
+    uppercut_elev_ext : float
+        Elevation threshold at the extension frame; below this → UPPERCUT.
+        Default 44° (midpoint of Hook 51° and Uppercut 37°).
+    hook_sh_yaw_range : float
+        Shoulder yaw range threshold; at or above this → HOOK.
+        Default 11° (midpoint of Jab 7° and Hook 15°).
 
     Returns
     -------
     str
         One of 'jab', 'hook', 'uppercut'.
     """
-    win_elev = elevation[start:end + 1]
-    win_reach = reach[start:end + 1]
-    elev_peak = float(np.max(win_elev))
-    reach_peak = float(np.max(win_reach))
+    win_elev  = elevation[start:end + 1]
+    win_elbow = elbow_angle[start:end + 1]
+    win_sh    = sh_yaw[start:end + 1]
+
+    # Extension frame: frame of maximum elbow angle (most extended arm)
+    ext_local   = int(np.argmax(win_elbow))
+    elev_at_ext = float(win_elev[ext_local])
+    sh_range    = float(np.max(win_sh) - np.min(win_sh))
 
     t = start / fps
-    print(f'    [classify] t={t:.2f}s  elev_peak={elev_peak:.1f}\u00b0  '
-          f'reach_peak={reach_peak:.3f}', end='')
+    print(f'    [classify] t={t:.2f}s  elev_at_ext={elev_at_ext:.1f}°  '
+          f'sh_yaw_range={sh_range:.1f}°', end='')
 
-    if elev_peak < uppercut_elev_peak:
-        print(' \u2192 UPPERCUT')
+    if elev_at_ext < uppercut_elev_ext:
+        print(' → UPPERCUT')
         return 'uppercut'
 
-    if reach_peak >= jab_reach_peak:
-        print(' \u2192 JAB')
-        return 'jab'
+    if sh_range >= hook_sh_yaw_range:
+        print(' → HOOK')
+        return 'hook'
 
-    print(' \u2192 HOOK')
-    return 'hook'
-
+    print(' → JAB')
+    return 'jab'
 
 def extract_punch_features(p, speed, elbow_angle, elevation, reach,
                            forearm_dir, vel, fps):
@@ -377,6 +388,10 @@ def main():
                         help='Minimum elbow angle peak to confirm punch (degrees, default: 120)')
     parser.add_argument('--punch-cooldown', type=float, default=200.0,
                         help='Cooldown between punches (ms, default: 200)')
+    parser.add_argument('--uppercut-elev-ext', type=float, default=44.0,
+                        help='Arm elevation threshold at extension for uppercut (deg, default: 44)')
+    parser.add_argument('--hook-sh-yaw-range', type=float, default=11.0,
+                        help='Shoulder yaw range threshold for hook (deg, default: 11)')
     args = parser.parse_args()
 
     video_path = os.path.abspath(os.path.expanduser(args.video))
@@ -448,6 +463,7 @@ def main():
     right_reach = []
     left_forearm = []   # body-frame forearm direction per frame (wrist - elbow)
     right_forearm = []
+    sh_yaw_raw = []     # shoulder-hip xfactor angle per frame (degrees)
     prev_lw = None
     prev_rw = None
 
@@ -487,6 +503,12 @@ def main():
             # Body frame axes: X=lateral, Y=forward (out of chest), Z=vertical (up)
             left_forearm.append(body[13] - body[12])
             right_forearm.append(body[16] - body[15])
+
+            # Shoulder yaw in body frame = xfactor (shoulder rotation relative to hips).
+            # The hip axis is always X in this frame, so arctan2(sh_y, sh_x) gives
+            # the shoulder-hip separation angle directly.
+            sh_vec = body[14] - body[11]   # r_shoulder - l_shoulder
+            sh_yaw_raw.append(float(np.degrees(np.arctan2(sh_vec[1], sh_vec[0]))))
         else:
             left_vel.append(np.array([0.0, 0.0, 0.0]))
             right_vel.append(np.array([0.0, 0.0, 0.0]))
@@ -498,6 +520,7 @@ def main():
             right_reach.append(0.0)
             left_forearm.append(np.array([0.0, 0.0, 0.0]))
             right_forearm.append(np.array([0.0, 0.0, 0.0]))
+            sh_yaw_raw.append(0.0)
             prev_lw = None
             prev_rw = None
 
@@ -511,6 +534,7 @@ def main():
     right_reach_raw = np.array(right_reach)
     left_forearm = np.array(left_forearm)   # (N, 3) body-frame forearm vectors
     right_forearm = np.array(right_forearm)
+    sh_yaw_arr = np.array(sh_yaw_raw)       # (N,) shoulder xfactor per frame
 
     # Butterworth low-pass filter: 2nd order, 6 Hz cutoff, zero-phase
     cutoff_hz = 6.0
@@ -525,6 +549,7 @@ def main():
         right_elbow = filtfilt(b, a, right_elbow_raw)
         left_reach_f = filtfilt(b, a, left_reach_raw)
         right_reach_f = filtfilt(b, a, right_reach_raw)
+        sh_yaw = filtfilt(b, a, sh_yaw_arr)
     else:
         left_vel = left_vel_raw
         right_vel = right_vel_raw
@@ -534,6 +559,7 @@ def main():
         right_elbow = right_elbow_raw
         left_reach_f = left_reach_raw
         right_reach_f = right_reach_raw
+        sh_yaw = sh_yaw_arr
 
     t_arr = np.arange(len(left_vel)) / video_fps
 
@@ -568,12 +594,16 @@ def main():
     # Classify each punch
     print('  Left hand classification:')
     for p in left_punches:
-        p['type'] = classify_punch(left_elev, left_reach_f,
-                                   p['start'], p['end'], video_fps)
+        p['type'] = classify_punch(left_elev, left_elbow, sh_yaw,
+                                   p['start'], p['end'], video_fps,
+                                   uppercut_elev_ext=args.uppercut_elev_ext,
+                                   hook_sh_yaw_range=args.hook_sh_yaw_range)
     print('  Right hand classification:')
     for p in right_punches:
-        p['type'] = classify_punch(right_elev, right_reach_f,
-                                   p['start'], p['end'], video_fps)
+        p['type'] = classify_punch(right_elev, right_elbow, sh_yaw,
+                                   p['start'], p['end'], video_fps,
+                                   uppercut_elev_ext=args.uppercut_elev_ext,
+                                   hook_sh_yaw_range=args.hook_sh_yaw_range)
 
     # ── Print feature analysis table ───────────────────────────────────
     def print_feature_table(label, feat_list):

@@ -1,2 +1,5 @@
 vids/
 pose_cache/
+Annotation_files/
+MotionBERT/
+MotionBERT_3d/
