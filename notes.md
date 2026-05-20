@@ -1,7 +1,50 @@
 
+## Pipeline:
+- Get footage
+- Get Yolo
+- Get MotionBert 3d estimate
+- filter and smooth coordinates.
+- Feature engineer
+- detect punch occurence.
+- Classify puch
+
+
+
+
+
+Metrics to use just consider left hand.
+
+Some during peak: (max length of arm)
+
+
+
+
+Some temporal: 
+** Important ** The path created: Straight line,  Curved upwards or curved sideways 
+- Should be travelling in different planes.
+
+
+
+
+
+
+
+## Fixes:
+- Interpolate nulls
+- Use same frame for elbow + elevation
+- How is max extension calculated
+- Performance gain if I classify around it?
+
+
+
+
+## Preprocessing steps:
+1. Smooth joint positions in root relative 3d using Savitzky Golay. 
+2. Swithces in basis modify speed calculations. Speed calculations should be made absolute. (Need to stabalize body frame)
+
+
+
 - Theres an overall bug with the frames returned freezing. 
-
-
 - right vs left can be distinguished with speed of the hand
 - A punch has elbow spike above 140 and elevation upto 80 lets say for threshold
 
@@ -9,14 +52,20 @@
 - Could use velocity in z axis to find upper cuts. 
 - Could use net speed for punch detection
 
-
-
-
-
 It may be a good idea to train decision tree on BoxIV data based on our metrics.
 
 
+## Notatoion and definition:
+Elevation: How high the uypper arm is lifted. 
+Elbow: Angle of the elbow
+
+
+
 ## Punch metrics:
+
+
+
+
 
 
 

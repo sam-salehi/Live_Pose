@@ -26,6 +26,8 @@ from openpyxl import load_workbook
 from scipy import stats
 from scipy.signal import savgol_filter
 
+from preprocessing import poses_to_body_frame_clip
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO     = Path(__file__).parent.resolve()
 POSE_DIR = REPO / "MotionBERT_3d"
@@ -94,49 +96,6 @@ def _load_annotations(xlsx: Path) -> list[tuple[int, int, str]]:
     wb.close()
     return rows
 
-# ── Body-frame normalisation ──────────────────────────────────────────────────
-def _to_body_frame(clip: np.ndarray) -> np.ndarray:
-    """
-    (T,17,3) raw → (T,17,3) body-frame, torso-normalised.
-
-    Axes (from live_pose3d.py convention):
-      X = lateral  (left hip → right hip)
-      Y = forward  (out of chest)
-      Z = vertical (pelvis → thorax)
-
-    Uses median pose for stable axis estimation, then applies once to all frames.
-    Scales by median torso length (pelvis → thorax distance).
-    """
-    # Centre on pelvis
-    q = clip - clip[:, [_PELVIS], :]
-
-    # Build axes from median pose (robust to outlier frames)
-    med = np.median(q, axis=0)  # (17, 3)
-
-    x_raw = med[_R_HIP] - med[_L_HIP]
-    xn = np.linalg.norm(x_raw)
-    if xn < 1e-8:
-        return q
-    x_hat = x_raw / xn
-
-    z_raw = med[_THORAX] - med[_PELVIS]
-    z_raw -= np.dot(z_raw, x_hat) * x_hat  # Gram-Schmidt
-    zn = np.linalg.norm(z_raw)
-    if zn < 1e-8:
-        return q
-    z_hat = z_raw / zn
-    y_hat = np.cross(z_hat, x_hat)
-
-    R = np.stack([x_hat, y_hat, z_hat])  # (3,3), rows = body axes
-    q = q @ R.T  # (T,17,3)
-
-    # Scale by torso length
-    torso = float(np.median(np.linalg.norm(q[:, _THORAX] - q[:, _PELVIS], axis=-1)))
-    if torso > 1e-6:
-        q /= torso
-    return q
-
-
 def _smooth(arr: np.ndarray, win: int = 5) -> np.ndarray:
     """Savitzky-Golay smoothing along time axis."""
     T = arr.shape[0]
@@ -183,7 +142,7 @@ def extract_features(clip_raw: np.ndarray, fps: float | None) -> dict | None:
     if T < 3:
         return None
 
-    q = _smooth(_to_body_frame(clip_raw.astype(np.float64)))  # (T,17,3)
+    q = _smooth(poses_to_body_frame_clip(clip_raw.astype(np.float64)))  # (T,17,3)
 
     # ── Left-arm elbow angles across clip ─────────────────────────────────
     elbow = np.array([_angle3(q[t, _L_SH], q[t, _L_EL], q[t, _L_WR]) for t in range(T)])

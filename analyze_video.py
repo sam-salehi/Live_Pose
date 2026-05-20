@@ -19,7 +19,6 @@ import argparse
 
 import numpy as np
 import cv2
-from scipy.signal import butter, filtfilt
 import matplotlib
 
 # TkAgg + OpenCV highgui on macOS often crashes the interpreter with
@@ -34,18 +33,15 @@ import matplotlib.pyplot as plt
 from live_pose3d import (
     draw_2d_skeleton,
     H36M_BONES,
-    normalize_to_body_frame,
-    arm_elevation_angle,
-    elbow_included_angle_deg,
 )
+from preprocessing import extract_motion_signals
 from protocol import send_msg, recv_msg
 
 
 def detect_punches(speed, elbow_angle, reach, fps,
                    speed_thresh_factor=2.0,
                    min_speed=3.0,
-                   min_elbow_peak=120.0,
-                   cooldown_ms=200,
+                   min_elbow_peak=90.0,
                    window_ms=250):
     """
     Detect punch events using a multi-signal state machine.
@@ -66,8 +62,6 @@ def detect_punches(speed, elbow_angle, reach, fps,
         Absolute minimum speed to trigger a candidate (torso-L/s).
     min_elbow_peak : float
         Minimum elbow angle peak within window to confirm punch (degrees).
-    cooldown_ms : float
-        Minimum gap between consecutive punches (milliseconds).
     window_ms : float
         Candidate window duration after trigger (milliseconds).
 
@@ -82,19 +76,12 @@ def detect_punches(speed, elbow_angle, reach, fps,
         return []
 
     window_frames = max(1, int(window_ms / 1000.0 * fps))
-    cooldown_frames = max(1, int(cooldown_ms / 1000.0 * fps))
     rolling_window = int(2.0 * fps)  # 2-second rolling window for adaptive threshold
 
     punches = []
-    last_punch_end = -cooldown_frames  # allow first punch immediately
 
     i = 0
     while i < N:
-        # Enforce cooldown
-        if i - last_punch_end < cooldown_frames:
-            i += 1
-            continue
-
         # Compute adaptive threshold from recent window
         win_start = max(0, i - rolling_window)
         recent_speed = speed[win_start:i + 1]
@@ -152,7 +139,6 @@ def detect_punches(speed, elbow_angle, reach, fps,
             'peak_elbow': float(peak_elbow_val),
         })
 
-        last_punch_end = end_frame
         i = win_end  # skip past this window
 
     return punches
@@ -386,8 +372,6 @@ def main():
                         help='Minimum speed to trigger punch candidate (torso-L/s, default: 3.0)')
     parser.add_argument('--punch-min-elbow', type=float, default=120.0,
                         help='Minimum elbow angle peak to confirm punch (degrees, default: 120)')
-    parser.add_argument('--punch-cooldown', type=float, default=200.0,
-                        help='Cooldown between punches (ms, default: 200)')
     parser.add_argument('--uppercut-elev-ext', type=float, default=44.0,
                         help='Arm elevation threshold at extension for uppercut (deg, default: 44)')
     parser.add_argument('--hook-sh-yaw-range', type=float, default=11.0,
@@ -451,144 +435,43 @@ def main():
     print(f'{len(all_joints)} pose frames at {video_fps:.1f} FPS')
 
 
-    # Pre-compute body-frame wrist velocities, arm angles, and reach
-    dt = 1.0 / video_fps
-    left_vel = []
-    right_vel = []
-    left_elev = []
-    right_elev = []
-    left_elbow = []
-    right_elbow = []
-    left_reach = []
-    right_reach = []
-    left_forearm = []   # body-frame forearm direction per frame (wrist - elbow)
-    right_forearm = []
-    sh_yaw_raw = []     # shoulder-hip xfactor angle per frame (degrees)
-    prev_lw = None
-    prev_rw = None
-
-    for joints in all_joints:
-        if joints is not None:
-            j3d = np.array(joints, dtype=np.float32)
-            body = normalize_to_body_frame(j3d, scale_by_torso=True)
-            lw = body[13].copy()
-            rw = body[16].copy()
-
-            if prev_lw is not None:
-                left_vel.append((lw - prev_lw) / dt)
-            else:
-                left_vel.append(np.array([0.0, 0.0, 0.0]))
-
-            if prev_rw is not None:
-                right_vel.append((rw - prev_rw) / dt)
-            else:
-                right_vel.append(np.array([0.0, 0.0, 0.0]))
-
-            prev_lw = lw
-            prev_rw = rw
-
-            # Arm elevation (0=hanging, 90=horizontal, 180=overhead)
-            left_elev.append(arm_elevation_angle(body, side='left', already_normalized=True))
-            right_elev.append(arm_elevation_angle(body, side='right', already_normalized=True))
-
-            # Elbow included angle (180=straight, 90=right angle)
-            left_elbow.append(elbow_included_angle_deg(j3d, side='left'))
-            right_elbow.append(elbow_included_angle_deg(j3d, side='right'))
-
-            # Wrist-to-shoulder distance (reach) in body frame
-            left_reach.append(np.linalg.norm(body[13] - body[11]))
-            right_reach.append(np.linalg.norm(body[16] - body[14]))
-
-            # Forearm direction in body frame: wrist - elbow
-            # Body frame axes: X=lateral, Y=forward (out of chest), Z=vertical (up)
-            left_forearm.append(body[13] - body[12])
-            right_forearm.append(body[16] - body[15])
-
-            # Shoulder yaw in body frame = xfactor (shoulder rotation relative to hips).
-            # The hip axis is always X in this frame, so arctan2(sh_y, sh_x) gives
-            # the shoulder-hip separation angle directly.
-            sh_vec = body[14] - body[11]   # r_shoulder - l_shoulder
-            sh_yaw_raw.append(float(np.degrees(np.arctan2(sh_vec[1], sh_vec[0]))))
-        else:
-            left_vel.append(np.array([0.0, 0.0, 0.0]))
-            right_vel.append(np.array([0.0, 0.0, 0.0]))
-            left_elev.append(0.0)
-            right_elev.append(0.0)
-            left_elbow.append(0.0)
-            right_elbow.append(0.0)
-            left_reach.append(0.0)
-            right_reach.append(0.0)
-            left_forearm.append(np.array([0.0, 0.0, 0.0]))
-            right_forearm.append(np.array([0.0, 0.0, 0.0]))
-            sh_yaw_raw.append(0.0)
-            prev_lw = None
-            prev_rw = None
-
-    left_vel_raw = np.array(left_vel)
-    right_vel_raw = np.array(right_vel)
-    left_elev_raw = np.array(left_elev)
-    right_elev_raw = np.array(right_elev)
-    left_elbow_raw = np.array(left_elbow)
-    right_elbow_raw = np.array(right_elbow)
-    left_reach_raw = np.array(left_reach)
-    right_reach_raw = np.array(right_reach)
-    left_forearm = np.array(left_forearm)   # (N, 3) body-frame forearm vectors
-    right_forearm = np.array(right_forearm)
-    sh_yaw_arr = np.array(sh_yaw_raw)       # (N,) shoulder xfactor per frame
-
-    # Butterworth low-pass filter: 2nd order, 6 Hz cutoff, zero-phase
-    cutoff_hz = 6.0
-    filter_order = 2
-    b, a = butter(filter_order, cutoff_hz, btype='low', fs=video_fps)
-    if len(left_vel_raw) > 3 * max(len(b), len(a)):
-        left_vel = filtfilt(b, a, left_vel_raw, axis=0)
-        right_vel = filtfilt(b, a, right_vel_raw, axis=0)
-        left_elev = filtfilt(b, a, left_elev_raw)
-        right_elev = filtfilt(b, a, right_elev_raw)
-        left_elbow = filtfilt(b, a, left_elbow_raw)
-        right_elbow = filtfilt(b, a, right_elbow_raw)
-        left_reach_f = filtfilt(b, a, left_reach_raw)
-        right_reach_f = filtfilt(b, a, right_reach_raw)
-        sh_yaw = filtfilt(b, a, sh_yaw_arr)
-    else:
-        left_vel = left_vel_raw
-        right_vel = right_vel_raw
-        left_elev = left_elev_raw
-        right_elev = right_elev_raw
-        left_elbow = left_elbow_raw
-        right_elbow = right_elbow_raw
-        left_reach_f = left_reach_raw
-        right_reach_f = right_reach_raw
-        sh_yaw = sh_yaw_arr
+    # Body-frame motion signals (normalization in preprocessing.py)
+    sig = extract_motion_signals(all_joints, video_fps)
+    left_vel = sig['left_vel']
+    right_vel = sig['right_vel']
+    left_elev = sig['left_elev']
+    right_elev = sig['right_elev']
+    left_elbow = sig['left_elbow']
+    right_elbow = sig['right_elbow']
+    left_reach = sig['left_reach']
+    right_reach = sig['right_reach']
+    left_forearm = sig['left_forearm']
+    right_forearm = sig['right_forearm']
+    sh_yaw = sig['sh_yaw']
+    left_speed = sig['left_speed']
+    right_speed = sig['right_speed']
 
     t_arr = np.arange(len(left_vel)) / video_fps
-
-    # Compute scalar speed (magnitude of velocity vector)
-    left_speed = np.linalg.norm(left_vel, axis=1)
-    right_speed = np.linalg.norm(right_vel, axis=1)
-    left_speed_raw = np.linalg.norm(left_vel_raw, axis=1)
-    right_speed_raw = np.linalg.norm(right_vel_raw, axis=1)
 
     # Detect punches
     punch_kwargs = dict(
         speed_thresh_factor=args.punch_speed_factor,
         min_speed=args.punch_min_speed,
         min_elbow_peak=args.punch_min_elbow,
-        cooldown_ms=args.punch_cooldown,
     )
-    left_punches = detect_punches(left_speed, left_elbow, left_reach_f, video_fps, **punch_kwargs)
-    right_punches = detect_punches(right_speed, right_elbow, right_reach_f, video_fps, **punch_kwargs)
+    left_punches = detect_punches(left_speed, left_elbow, left_reach, video_fps, **punch_kwargs)
+    right_punches = detect_punches(right_speed, right_elbow, right_reach, video_fps, **punch_kwargs)
 
     # Extract features for all punches
     left_feat_list = []
     for p in left_punches:
         feats = extract_punch_features(p, left_speed, left_elbow, left_elev,
-                                       left_reach_f, left_forearm, left_vel, video_fps)
+                                       left_reach, left_forearm, left_vel, video_fps)
         left_feat_list.append(feats)
     right_feat_list = []
     for p in right_punches:
         feats = extract_punch_features(p, right_speed, right_elbow, right_elev,
-                                       right_reach_f, right_forearm, right_vel, video_fps)
+                                       right_reach, right_forearm, right_vel, video_fps)
         right_feat_list.append(feats)
 
     # Classify each punch
@@ -893,99 +776,10 @@ def main():
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
 
-    # Save filtered plot as PNG
     video_base = os.path.splitext(video_path)[0]
-    plot_path = video_base + '_filtered.png'
+    plot_path = video_base + '_plot.png'
     fig.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f'Filtered plot saved to: {plot_path}')
-
-    # Save unfiltered plot as a separate PNG
-    fig_size = (12, 8) if args.speed else (12, 12)
-    fig_raw, axes_raw = plt.subplots(NUM_ROWS, 2, figsize=fig_size)
-    fig_raw.suptitle(f'{title} (unfiltered)', fontsize=14)
-
-    if args.speed:
-        axes_raw[0, 0].set_ylabel('Speed\n(torso-L/s)')
-        axes_raw[0, 0].grid(True, alpha=0.3)
-        axes_raw[0, 1].grid(True, alpha=0.3)
-        axes_raw[0, 0].plot(t_arr, left_speed_raw, linewidth=0.8, color='tab:blue')
-        axes_raw[0, 1].plot(t_arr, right_speed_raw, linewidth=0.8, color='tab:orange')
-        speed_max_raw = max(np.max(left_speed_raw), np.max(right_speed_raw)) * 1.05
-        axes_raw[0, 0].set_ylim(0, speed_max_raw)
-        axes_raw[0, 1].set_ylim(0, speed_max_raw)
-
-        axes_raw[1, 0].set_ylabel('Elevation\n(deg)')
-        axes_raw[1, 0].grid(True, alpha=0.3)
-        axes_raw[1, 1].grid(True, alpha=0.3)
-        axes_raw[1, 0].plot(t_arr, left_elev_raw, linewidth=0.8, color='tab:blue')
-        axes_raw[1, 1].plot(t_arr, right_elev_raw, linewidth=0.8, color='tab:orange')
-        axes_raw[1, 0].set_ylim(0, 180)
-        axes_raw[1, 1].set_ylim(0, 180)
-
-        axes_raw[2, 0].set_ylabel('Elbow\n(deg)')
-        axes_raw[2, 0].grid(True, alpha=0.3)
-        axes_raw[2, 1].grid(True, alpha=0.3)
-        axes_raw[2, 0].plot(t_arr, left_elbow_raw, linewidth=0.8, color='tab:blue')
-        axes_raw[2, 1].plot(t_arr, right_elbow_raw, linewidth=0.8, color='tab:orange')
-        axes_raw[2, 0].set_ylim(0, 180)
-        axes_raw[2, 1].set_ylim(0, 180)
-    else:
-        vel_labels = ['X (lateral)', 'Y (forward)', 'Z (vertical)']
-        all_vel_raw = np.concatenate([left_vel_raw, right_vel_raw], axis=0)
-        vel_max_raw = np.max(np.abs(all_vel_raw)) * 1.05
-        for row in range(3):
-            axes_raw[row, 0].set_ylabel(f'{vel_labels[row]}\nvel (torso-L/s)')
-            axes_raw[row, 0].grid(True, alpha=0.3)
-            axes_raw[row, 1].grid(True, alpha=0.3)
-            axes_raw[row, 0].plot(t_arr, left_vel_raw[:, row], linewidth=0.8, color='tab:blue')
-            axes_raw[row, 1].plot(t_arr, right_vel_raw[:, row], linewidth=0.8, color='tab:orange')
-            axes_raw[row, 0].set_ylim(-vel_max_raw, vel_max_raw)
-            axes_raw[row, 1].set_ylim(-vel_max_raw, vel_max_raw)
-
-        axes_raw[3, 0].set_ylabel('Elevation\n(deg)')
-        axes_raw[3, 0].grid(True, alpha=0.3)
-        axes_raw[3, 1].grid(True, alpha=0.3)
-        axes_raw[3, 0].plot(t_arr, left_elev_raw, linewidth=0.8, color='tab:blue')
-        axes_raw[3, 1].plot(t_arr, right_elev_raw, linewidth=0.8, color='tab:orange')
-        axes_raw[3, 0].set_ylim(0, 180)
-        axes_raw[3, 1].set_ylim(0, 180)
-
-        axes_raw[4, 0].set_ylabel('Elbow\n(deg)')
-        axes_raw[4, 0].grid(True, alpha=0.3)
-        axes_raw[4, 1].grid(True, alpha=0.3)
-        axes_raw[4, 0].plot(t_arr, left_elbow_raw, linewidth=0.8, color='tab:blue')
-        axes_raw[4, 1].plot(t_arr, right_elbow_raw, linewidth=0.8, color='tab:orange')
-        axes_raw[4, 0].set_ylim(0, 180)
-        axes_raw[4, 1].set_ylim(0, 180)
-
-    # Shade detected punch regions on raw plot, colored by punch type
-    for p in left_punches:
-        t_start = p['start'] / video_fps
-        t_end = p['end'] / video_fps
-        color = PUNCH_COLORS[p['type']]
-        for row in range(NUM_ROWS):
-            axes_raw[row, 0].axvspan(t_start, t_end, alpha=0.15, color=color)
-    for p in right_punches:
-        t_start = p['start'] / video_fps
-        t_end = p['end'] / video_fps
-        color = PUNCH_COLORS[p['type']]
-        for row in range(NUM_ROWS):
-            axes_raw[row, 1].axvspan(t_start, t_end, alpha=0.15, color=color)
-
-    axes_raw[0, 0].set_title('Left')
-    axes_raw[0, 1].set_title('Right')
-    axes_raw[NUM_ROWS - 1, 0].set_xlabel('Time (s)')
-    axes_raw[NUM_ROWS - 1, 1].set_xlabel('Time (s)')
-
-    legend_patches = [Patch(facecolor=c, alpha=0.3, label=t.capitalize())
-                      for t, c in PUNCH_COLORS.items()]
-    axes_raw[0, 1].legend(handles=legend_patches, loc='upper right', fontsize=8)
-
-    fig_raw.tight_layout()
-
-    plot_raw_path = video_base + '_unfiltered.png'
-    fig_raw.savefig(plot_raw_path, dpi=150, bbox_inches='tight')
-    print(f'Unfiltered plot saved to: {plot_raw_path}')
+    print(f'Plot saved to: {plot_path}')
 
     # Keep plots open
     plt.ioff()

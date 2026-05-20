@@ -12,13 +12,8 @@ import hashlib
 import argparse
 
 import numpy as np
-from scipy.signal import butter, filtfilt
 
-from live_pose3d import (
-    normalize_to_body_frame,
-    arm_elevation_angle,
-    elbow_included_angle_deg,
-)
+from preprocessing import extract_motion_signals
 from analyze_video import detect_punches, extract_punch_features, classify_punch
 
 
@@ -28,7 +23,6 @@ def main():
     parser.add_argument('--punch-speed-factor', type=float, default=2.0)
     parser.add_argument('--punch-min-speed', type=float, default=3.0)
     parser.add_argument('--punch-min-elbow', type=float, default=120.0)
-    parser.add_argument('--punch-cooldown', type=float, default=200.0)
     args = parser.parse_args()
 
     video_path = os.path.abspath(os.path.expanduser(args.video))
@@ -57,107 +51,37 @@ def main():
     print(f'Video: {video_path}')
     print(f'{len(all_joints)} frames at {video_fps:.1f} FPS')
 
-    # ── Replicate signal extraction from analyze_video.py ──
-    dt = 1.0 / video_fps
-    left_vel = []
-    right_vel = []
-    left_elev = []
-    right_elev = []
-    left_elbow = []
-    right_elbow = []
-    left_reach = []
-    right_reach = []
-    left_forearm = []
-    right_forearm = []
-    prev_lw = None
-    prev_rw = None
-
-    for joints in all_joints:
-        if joints is not None:
-            j3d = np.array(joints, dtype=np.float32)
-            body = normalize_to_body_frame(j3d, scale_by_torso=True)
-            lw = body[13].copy()
-            rw = body[16].copy()
-
-            left_vel.append((lw - prev_lw) / dt if prev_lw is not None else np.zeros(3))
-            right_vel.append((rw - prev_rw) / dt if prev_rw is not None else np.zeros(3))
-            prev_lw = lw
-            prev_rw = rw
-
-            left_elev.append(arm_elevation_angle(body, side='left', already_normalized=True))
-            right_elev.append(arm_elevation_angle(body, side='right', already_normalized=True))
-            left_elbow.append(elbow_included_angle_deg(j3d, side='left'))
-            right_elbow.append(elbow_included_angle_deg(j3d, side='right'))
-            left_reach.append(np.linalg.norm(body[13] - body[11]))
-            right_reach.append(np.linalg.norm(body[16] - body[14]))
-            left_forearm.append(body[13] - body[12])
-            right_forearm.append(body[16] - body[15])
-        else:
-            left_vel.append(np.zeros(3))
-            right_vel.append(np.zeros(3))
-            left_elev.append(0.0)
-            right_elev.append(0.0)
-            left_elbow.append(0.0)
-            right_elbow.append(0.0)
-            left_reach.append(0.0)
-            right_reach.append(0.0)
-            left_forearm.append(np.zeros(3))
-            right_forearm.append(np.zeros(3))
-            prev_lw = None
-            prev_rw = None
-
-    left_vel_raw = np.array(left_vel)
-    right_vel_raw = np.array(right_vel)
-    left_elev_raw = np.array(left_elev)
-    right_elev_raw = np.array(right_elev)
-    left_elbow_raw = np.array(left_elbow)
-    right_elbow_raw = np.array(right_elbow)
-    left_reach_raw = np.array(left_reach)
-    right_reach_raw = np.array(right_reach)
-    left_forearm = np.array(left_forearm)
-    right_forearm = np.array(right_forearm)
-
-    cutoff_hz = 6.0
-    b, a = butter(2, cutoff_hz, btype='low', fs=video_fps)
-    if len(left_vel_raw) > 3 * max(len(b), len(a)):
-        left_vel = filtfilt(b, a, left_vel_raw, axis=0)
-        right_vel = filtfilt(b, a, right_vel_raw, axis=0)
-        left_elev = filtfilt(b, a, left_elev_raw)
-        right_elev = filtfilt(b, a, right_elev_raw)
-        left_elbow = filtfilt(b, a, left_elbow_raw)
-        right_elbow = filtfilt(b, a, right_elbow_raw)
-        left_reach_f = filtfilt(b, a, left_reach_raw)
-        right_reach_f = filtfilt(b, a, right_reach_raw)
-    else:
-        left_vel = left_vel_raw
-        right_vel = right_vel_raw
-        left_elev = left_elev_raw
-        right_elev = right_elev_raw
-        left_elbow = left_elbow_raw
-        right_elbow = right_elbow_raw
-        left_reach_f = left_reach_raw
-        right_reach_f = right_reach_raw
-
-    left_speed = np.linalg.norm(left_vel, axis=1)
-    right_speed = np.linalg.norm(right_vel, axis=1)
+    sig = extract_motion_signals(all_joints, video_fps)
+    left_vel = sig['left_vel']
+    right_vel = sig['right_vel']
+    left_elev = sig['left_elev']
+    right_elev = sig['right_elev']
+    left_elbow = sig['left_elbow']
+    right_elbow = sig['right_elbow']
+    left_reach = sig['left_reach']
+    right_reach = sig['right_reach']
+    left_forearm = sig['left_forearm']
+    right_forearm = sig['right_forearm']
+    sh_yaw = sig['sh_yaw']
+    left_speed = sig['left_speed']
+    right_speed = sig['right_speed']
 
     # Detect punches
     punch_kwargs = dict(
         speed_thresh_factor=args.punch_speed_factor,
         min_speed=args.punch_min_speed,
         min_elbow_peak=args.punch_min_elbow,
-        cooldown_ms=args.punch_cooldown,
     )
-    left_punches = detect_punches(left_speed, left_elbow, left_reach_f, video_fps, **punch_kwargs)
-    right_punches = detect_punches(right_speed, right_elbow, right_reach_f, video_fps, **punch_kwargs)
+    left_punches = detect_punches(left_speed, left_elbow, left_reach, video_fps, **punch_kwargs)
+    right_punches = detect_punches(right_speed, right_elbow, right_reach, video_fps, **punch_kwargs)
 
     # Extract features and classify
     left_feat_list = []
     print('  Left hand classification:')
     for p in left_punches:
         feats = extract_punch_features(p, left_speed, left_elbow, left_elev,
-                                       left_reach_f, left_forearm, left_vel, video_fps)
-        p['type'] = classify_punch(left_elev, left_reach_f,
+                                       left_reach, left_forearm, left_vel, video_fps)
+        p['type'] = classify_punch(left_elev, left_elbow, sh_yaw,
                                    p['start'], p['end'], video_fps)
         feats['classified_as'] = p['type']
         left_feat_list.append(feats)
@@ -165,8 +89,8 @@ def main():
     print('  Right hand classification:')
     for p in right_punches:
         feats = extract_punch_features(p, right_speed, right_elbow, right_elev,
-                                       right_reach_f, right_forearm, right_vel, video_fps)
-        p['type'] = classify_punch(right_elev, right_reach_f,
+                                       right_reach, right_forearm, right_vel, video_fps)
+        p['type'] = classify_punch(right_elev, right_elbow, sh_yaw,
                                    p['start'], p['end'], video_fps)
         feats['classified_as'] = p['type']
         right_feat_list.append(feats)
